@@ -11,3 +11,5 @@
 *.pyzw
 *.pyz
 *.pywz
+faiss_index/*
+compressed_context/*
