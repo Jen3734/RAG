@@ -1,0 +1,6 @@
+
+#remove the faiss_index
+
+Remove-Item -Recurse -Force faiss_index
+.\run_ragFAISS.bat
+
