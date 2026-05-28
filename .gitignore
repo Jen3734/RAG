@@ -12,5 +12,6 @@
 *.pyz
 *.pywz
 *.dll
+*.log
 faiss_index/
 compressed_context
