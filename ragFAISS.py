@@ -15,7 +15,6 @@ API keys are read from HF_auth.log and deepseek_api_auth.log in this folder.
 """
 
 import os
-import re
 import sys
 import uuid
 from pathlib import Path
@@ -23,20 +22,18 @@ from pathlib import Path
 import faiss
 import numpy as np
 
+from searchEngine import RagSearchEngine
 from tocLoader import TocEntry, TocLoader, format_toc_entries
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 HF_AUTH_LOG = SCRIPT_DIR / "HF_auth.log"
 DEEPSEEK_AUTH_LOG = SCRIPT_DIR / "deepseek_api_auth.log"
 
-from langchain_classic.chains import create_retrieval_chain
-from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_community.docstore.in_memory import InMemoryDocstore
 from langchain_community.vectorstores import FAISS
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -66,6 +63,7 @@ CHUNK_OVERLAP = 30
 RETRIEVAL_K = 8
 TOC_TOPIC_K = 5
 TOC_CANDIDATE_POOL = 100
+CHUNK_HEAD_CHARS = 150
 TOC_TEXT_SCAN_MAX_PAGES = 15
 TOC_CONTENTS_KEYWORDS = ("table of contents", "contents", "chapter", "section")
 
@@ -238,157 +236,6 @@ def load_vector_store(
     return vector_store
 
 
-def build_rag_chain(vector_store: FAISS, llm: BaseChatModel | None = None):
-    llm = llm or build_llm()
-    retriever = vector_store.as_retriever(search_kwargs={"k": RETRIEVAL_K})
-
-    prompt = ChatPromptTemplate.from_template(
-        "Answer the question using only the context below. "
-        "If the context does not contain enough information, say you don't know.\n\n"
-        "Context:\n{context}\n\n"
-        "Question: {input}"
-    )
-    combine_docs_chain = create_stuff_documents_chain(llm, prompt)
-    return create_retrieval_chain(retriever, combine_docs_chain)
-
-
-TOC_SELECT_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You match user questions to manual table-of-contents entries. "
-            "Pick the entries most likely to contain the answer. "
-            "Return ONLY comma-separated line numbers from the list (e.g. 3,7,12). "
-            "No explanation.",
-        ),
-        (
-            "human",
-            "Question: {query}\n\n"
-            "Pick up to {k} most relevant TOC entries:\n"
-            "{toc_list}\n\n"
-            "Line numbers:",
-        ),
-    ]
-)
-
-
-def _prefilter_toc_candidates(
-    toc_entries: list[TocEntry],
-    query: str,
-    max_candidates: int = TOC_CANDIDATE_POOL,
-) -> list[tuple[int, TocEntry]]:
-    """Narrow TOC to a candidate pool before LLM selection."""
-    query_terms = [t for t in re.findall(r"\w+", query.lower()) if len(t) > 2]
-    scored: list[tuple[int, int, TocEntry]] = []
-
-    for idx, entry in enumerate(toc_entries):
-        title_lower = entry["title"].lower()
-        score = sum(1 for term in query_terms if term in title_lower)
-        if score:
-            scored.append((score, idx, entry))
-
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    candidates = [(idx, entry) for _, idx, entry in scored[:max_candidates]]
-
-    if len(candidates) < max_candidates:
-        seen = {idx for idx, _ in candidates}
-        for idx, entry in enumerate(toc_entries):
-            if idx in seen:
-                continue
-            if entry["level"] <= 2:
-                candidates.append((idx, entry))
-            if len(candidates) >= max_candidates:
-                break
-
-    return candidates[:max_candidates]
-
-
-def _parse_toc_line_numbers(response: str, max_index: int) -> list[int]:
-    numbers = []
-    for part in re.findall(r"\d+", response):
-        num = int(part)
-        if 1 <= num <= max_index and num not in numbers:
-            numbers.append(num)
-    return numbers
-
-
-def select_related_toc_topics(
-    toc_entries: list[TocEntry],
-    query: str,
-    llm: BaseChatModel,
-    k: int = TOC_TOPIC_K,
-) -> list[TocEntry]:
-    """
-    Use the LLM to pick up to k TOC topics most related to the query.
-
-    Large TOCs are pre-filtered to TOC_CANDIDATE_POOL entries first.
-    """
-    if not toc_entries or k <= 0:
-        return []
-
-    candidates = _prefilter_toc_candidates(toc_entries, query)
-    if not candidates:
-        return []
-
-    toc_list = "\n".join(
-        f"{line_num}. {entry['title']}"
-        + (f" (p. {entry['page']})" if entry["page"] is not None else "")
-        for line_num, (_, entry) in enumerate(candidates, start=1)
-    )
-
-    chain = TOC_SELECT_PROMPT | llm
-    response = chain.invoke({"query": query, "k": k, "toc_list": toc_list})
-    content = response.content if isinstance(response.content, str) else str(response.content)
-
-    selected_lines = _parse_toc_line_numbers(content, len(candidates))[:k]
-    if not selected_lines:
-        _log("LLM returned no TOC matches; using top keyword candidates.")
-        return [entry for _, entry in candidates[:k]]
-
-    return [candidates[line - 1][1] for line in selected_lines]
-
-
-def _augment_query_with_toc_topics(query: str, topics: list[TocEntry]) -> str:
-    if not topics:
-        return query
-    hints = "\n".join(
-        f"- {entry['title']}"
-        + (f" (page {entry['page']})" if entry["page"] is not None else "")
-        for entry in topics
-    )
-    return (
-        f"{query}\n\n"
-        "Focus retrieval on these manual sections from the table of contents:\n"
-        f"{hints}"
-    )
-
-
-def query(
-    rag_chain,
-    question: str,
-    *,
-    toc_entries: list[TocEntry] | None = None,
-    llm: BaseChatModel | None = None,
-    topic_k: int = TOC_TOPIC_K,
-) -> str:
-    """Run RAG query, optionally guided by LLM-selected TOC topics."""
-    augmented = question
-    if toc_entries:
-        selector_llm = llm or build_llm()
-        related = select_related_toc_topics(
-            toc_entries, question, selector_llm, k=topic_k
-        )
-        if related:
-            _log("TOC topics selected for query:")
-            for entry in related:
-                page = f" (p. {entry['page']})" if entry["page"] is not None else ""
-                _log(f"  - {entry['title']}{page}")
-            augmented = _augment_query_with_toc_topics(question, related)
-
-    result = rag_chain.invoke({"input": augmented})
-    return result["answer"]
-
-
 def load_document_toc(
     file_path: Path | str = DOCUMENT_FILE_PATH,
     *,
@@ -434,6 +281,18 @@ def get_or_build_vector_store(embeddings: HuggingFaceEmbeddings) -> FAISS:
     return vector_store
 
 
+def run_question_with_search_trace(
+    search_engine: RagSearchEngine,
+    question: str,
+) -> str:
+    """Run one question: print sub-queries, chunk heads, then return the answer."""
+    sub_queries, doc_lists, merged_docs = search_engine.retrieve_all(question)
+    search_engine.print_search_details(question, sub_queries, doc_lists)
+    _log(f"Merged {len(merged_docs)} unique chunk(s) for final answer.")
+    answer = search_engine.synthesize_answer(question, sub_queries, merged_docs)
+    return answer
+
+
 def main():
     if not DEEPSEEK_API_KEY:
         _log(f"Error: set DEEPSEEK_API_KEY in {DEEPSEEK_AUTH_LOG.name}.")
@@ -453,7 +312,16 @@ def main():
 
     _log("Connecting to DeepSeek API...")
     llm = build_llm()
-    rag_chain = build_rag_chain(vector_store, llm)
+    search_engine = RagSearchEngine(
+        vector_store,
+        llm,
+        toc_entries=toc_entries,
+        retrieval_k=RETRIEVAL_K,
+        topic_k=TOC_TOPIC_K,
+        toc_candidate_pool=TOC_CANDIDATE_POOL,
+        chunk_head_chars=CHUNK_HEAD_CHARS,
+        log_fn=_log,
+    )
 
     questions = [
         "Explain what is the Backup Timer Indicator",
@@ -464,7 +332,7 @@ def main():
     ]
     for q in questions:
         _log(f"\nQ: {q}")
-        _log(f"A: {query(rag_chain, q, toc_entries=toc_entries, llm=llm)}")
+        _log(f"A: {run_question_with_search_trace(search_engine, q)}")
 
 
 if __name__ == "__main__":
