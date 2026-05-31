@@ -16,3 +16,4 @@ Remove-Item -Recurse -Force faiss_index
     1. idea 1: split the query in chunks to search unrelated chunks in mulitple vector store query and feed the query and the mutiple search result to llm to build relationships(check)
         1. how to constrain queries? There are too many duplicated sub-queries. modify the prompt to limit the subquerys and ask for no duplicated queries in meaning(check)
             1. next step would be to further consice the sub queries. some are still duplicated, but most sub queries various in meanings.
+3. Add image capabilities
