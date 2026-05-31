@@ -4,3 +4,13 @@
 Remove-Item -Recurse -Force faiss_index
 .\run_ragFAISS.bat
 
+
+
+
+####thinking process######
+1. first step is to accelerate the index building and searching process
+    1. tune nlist and nprobe to fasten search index (check)
+    2. tune the chunk size and chunk overlap to detail the search and precision the search (check)
+    3. separate the doc into multiple segemnts and build index and search independently and in parallel through threads
+2. second step is to enhance the reasoning capabilities
+    1. idea 1: split the query in chunks to search unrelated chunks in mulitple vector store query and feed the query and the mutiple search result to llm to build relationships

@@ -15,8 +15,15 @@ API keys are read from HF_auth.log and deepseek_api_auth.log in this folder.
 """
 
 import os
+import re
 import sys
+import uuid
 from pathlib import Path
+
+import faiss
+import numpy as np
+
+from tocLoader import TocEntry, TocLoader, format_toc_entries
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 HF_AUTH_LOG = SCRIPT_DIR / "HF_auth.log"
@@ -32,8 +39,6 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-import faiss
 
 # --- Configuration ---
 
@@ -54,9 +59,15 @@ DEEPSEEK_API_KEY = _load_secret_from_log(DEEPSEEK_AUTH_LOG, "DEEPSEEK_API_KEY")
 DEEPSEEK_MODEL = "deepseek-chat"
 EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
 FAISS_INDEX_PATH = "faiss_index"
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
-RETRIEVAL_K = 4
+FAISS_IVF_NLIST = 110
+FAISS_NPROBE = 32
+CHUNK_SIZE = 200
+CHUNK_OVERLAP = 30
+RETRIEVAL_K = 8
+TOC_TOPIC_K = 5
+TOC_CANDIDATE_POOL = 100
+TOC_TEXT_SCAN_MAX_PAGES = 15
+TOC_CONTENTS_KEYWORDS = ("table of contents", "contents", "chapter", "section")
 
 DOCUMENT_FILE_PATH = Path(
     r"C:\Users\jenni\Documents\books\rag"
@@ -145,21 +156,72 @@ def load_and_split_documents(file_path: Path | str = DOCUMENT_FILE_PATH):
     return splits
 
 
+def build_faiss_ivf_sq8_index(
+    vectors: np.ndarray,
+    *,
+    nlist: int = FAISS_IVF_NLIST,
+    nprobe: int = FAISS_NPROBE,
+) -> faiss.Index:
+    """Build a FAISS IVF index with 8-bit scalar quantization (IVF + SQ8)."""
+    if vectors.ndim != 2:
+        raise ValueError("vectors must be a 2D array")
+    num_vectors, embedding_dim = vectors.shape
+    if num_vectors == 0:
+        raise ValueError("Need at least one vector to build the index")
+
+    effective_nlist = min(nlist, num_vectors)
+    if effective_nlist < nlist:
+        _log(
+            f"Clamping IVF nlist from {nlist} to {effective_nlist} "
+            f"(only {num_vectors} vectors available)."
+        )
+
+    quantizer = faiss.IndexFlatL2(embedding_dim)
+    index = faiss.IndexIVFScalarQuantizer(
+        quantizer,
+        embedding_dim,
+        effective_nlist,
+        faiss.ScalarQuantizer.QT_8bit,
+    )
+
+    _log(f"Training FAISS IVF{effective_nlist},SQ8 index on {num_vectors} vectors...")
+    index.train(vectors)
+    index.add(vectors)
+    index.nprobe = min(nprobe, effective_nlist)
+    _log(f"FAISS index ready (nlist={effective_nlist}, nprobe={index.nprobe}).")
+    return index
+
+
+def _configure_faiss_search(index: faiss.Index, nprobe: int = FAISS_NPROBE) -> None:
+    """Set nprobe on IVF indexes when loading from disk."""
+    if isinstance(index, faiss.IndexIVF):
+        index.nprobe = min(nprobe, index.nlist)
+
+
 def build_vector_store(
     splits,
     embeddings: HuggingFaceEmbeddings | None = None,
 ) -> FAISS:
     embeddings = embeddings or build_embeddings()
-    embedding_dim = len(embeddings.embed_query("hello world"))
-    index = faiss.IndexFlatL2(embedding_dim)
-    vector_store = FAISS(
+    texts = [doc.page_content for doc in splits]
+    _log(f"Embedding {len(texts)} chunks for IVF,SQ8 index...")
+    vectors = np.array(embeddings.embed_documents(texts), dtype=np.float32)
+
+    index = build_faiss_ivf_sq8_index(vectors)
+
+    docstore = InMemoryDocstore()
+    index_to_docstore_id: dict[int, str] = {}
+    for i, doc in enumerate(splits):
+        doc_id = str(uuid.uuid4())
+        index_to_docstore_id[i] = doc_id
+        docstore.add({doc_id: doc})
+
+    return FAISS(
         embedding_function=embeddings,
         index=index,
-        docstore=InMemoryDocstore(),
-        index_to_docstore_id={},
+        docstore=docstore,
+        index_to_docstore_id=index_to_docstore_id,
     )
-    vector_store.add_documents(documents=splits)
-    return vector_store
 
 
 def save_vector_store(vector_store: FAISS, path: str = FAISS_INDEX_PATH) -> None:
@@ -171,7 +233,9 @@ def load_vector_store(
     embeddings: HuggingFaceEmbeddings | None = None,
 ) -> FAISS:
     embeddings = embeddings or build_embeddings()
-    return FAISS.load_local(path, embeddings, allow_dangerous_deserialization=True)
+    vector_store = FAISS.load_local(path, embeddings, allow_dangerous_deserialization=True)
+    _configure_faiss_search(vector_store.index)
+    return vector_store
 
 
 def build_rag_chain(vector_store: FAISS, llm: BaseChatModel | None = None):
@@ -188,9 +252,171 @@ def build_rag_chain(vector_store: FAISS, llm: BaseChatModel | None = None):
     return create_retrieval_chain(retriever, combine_docs_chain)
 
 
-def query(rag_chain, question: str) -> str:
-    result = rag_chain.invoke({"input": question})
+TOC_SELECT_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You match user questions to manual table-of-contents entries. "
+            "Pick the entries most likely to contain the answer. "
+            "Return ONLY comma-separated line numbers from the list (e.g. 3,7,12). "
+            "No explanation.",
+        ),
+        (
+            "human",
+            "Question: {query}\n\n"
+            "Pick up to {k} most relevant TOC entries:\n"
+            "{toc_list}\n\n"
+            "Line numbers:",
+        ),
+    ]
+)
+
+
+def _prefilter_toc_candidates(
+    toc_entries: list[TocEntry],
+    query: str,
+    max_candidates: int = TOC_CANDIDATE_POOL,
+) -> list[tuple[int, TocEntry]]:
+    """Narrow TOC to a candidate pool before LLM selection."""
+    query_terms = [t for t in re.findall(r"\w+", query.lower()) if len(t) > 2]
+    scored: list[tuple[int, int, TocEntry]] = []
+
+    for idx, entry in enumerate(toc_entries):
+        title_lower = entry["title"].lower()
+        score = sum(1 for term in query_terms if term in title_lower)
+        if score:
+            scored.append((score, idx, entry))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    candidates = [(idx, entry) for _, idx, entry in scored[:max_candidates]]
+
+    if len(candidates) < max_candidates:
+        seen = {idx for idx, _ in candidates}
+        for idx, entry in enumerate(toc_entries):
+            if idx in seen:
+                continue
+            if entry["level"] <= 2:
+                candidates.append((idx, entry))
+            if len(candidates) >= max_candidates:
+                break
+
+    return candidates[:max_candidates]
+
+
+def _parse_toc_line_numbers(response: str, max_index: int) -> list[int]:
+    numbers = []
+    for part in re.findall(r"\d+", response):
+        num = int(part)
+        if 1 <= num <= max_index and num not in numbers:
+            numbers.append(num)
+    return numbers
+
+
+def select_related_toc_topics(
+    toc_entries: list[TocEntry],
+    query: str,
+    llm: BaseChatModel,
+    k: int = TOC_TOPIC_K,
+) -> list[TocEntry]:
+    """
+    Use the LLM to pick up to k TOC topics most related to the query.
+
+    Large TOCs are pre-filtered to TOC_CANDIDATE_POOL entries first.
+    """
+    if not toc_entries or k <= 0:
+        return []
+
+    candidates = _prefilter_toc_candidates(toc_entries, query)
+    if not candidates:
+        return []
+
+    toc_list = "\n".join(
+        f"{line_num}. {entry['title']}"
+        + (f" (p. {entry['page']})" if entry["page"] is not None else "")
+        for line_num, (_, entry) in enumerate(candidates, start=1)
+    )
+
+    chain = TOC_SELECT_PROMPT | llm
+    response = chain.invoke({"query": query, "k": k, "toc_list": toc_list})
+    content = response.content if isinstance(response.content, str) else str(response.content)
+
+    selected_lines = _parse_toc_line_numbers(content, len(candidates))[:k]
+    if not selected_lines:
+        _log("LLM returned no TOC matches; using top keyword candidates.")
+        return [entry for _, entry in candidates[:k]]
+
+    return [candidates[line - 1][1] for line in selected_lines]
+
+
+def _augment_query_with_toc_topics(query: str, topics: list[TocEntry]) -> str:
+    if not topics:
+        return query
+    hints = "\n".join(
+        f"- {entry['title']}"
+        + (f" (page {entry['page']})" if entry["page"] is not None else "")
+        for entry in topics
+    )
+    return (
+        f"{query}\n\n"
+        "Focus retrieval on these manual sections from the table of contents:\n"
+        f"{hints}"
+    )
+
+
+def query(
+    rag_chain,
+    question: str,
+    *,
+    toc_entries: list[TocEntry] | None = None,
+    llm: BaseChatModel | None = None,
+    topic_k: int = TOC_TOPIC_K,
+) -> str:
+    """Run RAG query, optionally guided by LLM-selected TOC topics."""
+    augmented = question
+    if toc_entries:
+        selector_llm = llm or build_llm()
+        related = select_related_toc_topics(
+            toc_entries, question, selector_llm, k=topic_k
+        )
+        if related:
+            _log("TOC topics selected for query:")
+            for entry in related:
+                page = f" (p. {entry['page']})" if entry["page"] is not None else ""
+                _log(f"  - {entry['title']}{page}")
+            augmented = _augment_query_with_toc_topics(question, related)
+
+    result = rag_chain.invoke({"input": augmented})
     return result["answer"]
+
+
+def load_document_toc(
+    file_path: Path | str = DOCUMENT_FILE_PATH,
+    *,
+    preview_count: int = 12,
+) -> tuple[list[TocEntry], str]:
+    """Load PDF table of contents and print a preview."""
+    path = Path(file_path)
+    if path.suffix.lower() != ".pdf":
+        _log("TOC loader skipped (document is not a PDF).")
+        return [], "skipped"
+
+    _log(f"Loading table of contents from {path.name}...")
+    toc_loader = TocLoader(
+        max_text_pages=TOC_TEXT_SCAN_MAX_PAGES,
+        contents_keywords=TOC_CONTENTS_KEYWORDS,
+        log_fn=_log,
+    )
+    toc_entries, toc_method = toc_loader.load(path)
+
+    if toc_entries:
+        _log(f"Table of contents preview ({toc_method}):")
+        _log(format_toc_entries(toc_entries[:preview_count]))
+        if len(toc_entries) > preview_count:
+            _log(f"... and {len(toc_entries) - preview_count} more entries.")
+    else:
+        _log("No table of contents entries found.")
+
+    return toc_entries, toc_method
 
 
 def get_or_build_vector_store(embeddings: HuggingFaceEmbeddings) -> FAISS:
@@ -218,21 +444,27 @@ def main():
     else:
         _log("HF_TOKEN not set; using anonymous Hub access (may be slower).")
 
+    toc_entries, toc_method = load_document_toc()
+
     _log("Loading embedding model (downloads on first run)...")
     embeddings = build_embeddings()
 
     vector_store = get_or_build_vector_store(embeddings)
 
     _log("Connecting to DeepSeek API...")
-    rag_chain = build_rag_chain(vector_store, build_llm())
+    llm = build_llm()
+    rag_chain = build_rag_chain(vector_store, llm)
 
     questions = [
         "Explain what is the Backup Timer Indicator",
         "what to do if a ct scan is aborted?",
+        "what is the difference between a scout and a primary scan?",
+        "what is the difference between a GSI scan and a helical scan?",
+        "what are the major axial scan rotation frequencies?",
     ]
     for q in questions:
         _log(f"\nQ: {q}")
-        _log(f"A: {query(rag_chain, q)}")
+        _log(f"A: {query(rag_chain, q, toc_entries=toc_entries, llm=llm)}")
 
 
 if __name__ == "__main__":
