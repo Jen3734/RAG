@@ -16,6 +16,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from tocLoader import TocEntry
 
 DEFAULT_RETRIEVAL_K = 8
+DEFAULT_IMAGE_RETRIEVAL_K = 4
 DEFAULT_TOC_TOPIC_K = 5
 DEFAULT_TOC_CANDIDATE_POOL = 100
 DEFAULT_CHUNK_HEAD_CHARS = 150
@@ -216,7 +217,15 @@ def _format_documents_for_prompt(docs: list[Document]) -> str:
     blocks = []
     for i, doc in enumerate(docs, start=1):
         source = doc.metadata.get("source", "unknown")
-        blocks.append(f"[{i}] Source: {source}\n{doc.page_content}")
+        if doc.metadata.get("modality") == "image":
+            image_path = doc.metadata.get("image_path", "unknown")
+            blocks.append(
+                f"[{i}] Image source: {source}\n"
+                f"Image file: {image_path}\n"
+                f"{doc.page_content}"
+            )
+        else:
+            blocks.append(f"[{i}] Source: {source}\n{doc.page_content}")
     return "\n\n".join(blocks)
 
 
@@ -229,16 +238,20 @@ class RagSearchEngine:
         llm: BaseChatModel,
         *,
         toc_entries: list[TocEntry] | None = None,
+        image_vector_store: FAISS | None = None,
         retrieval_k: int = DEFAULT_RETRIEVAL_K,
+        image_retrieval_k: int = DEFAULT_IMAGE_RETRIEVAL_K,
         topic_k: int = DEFAULT_TOC_TOPIC_K,
         toc_candidate_pool: int = DEFAULT_TOC_CANDIDATE_POOL,
         chunk_head_chars: int = DEFAULT_CHUNK_HEAD_CHARS,
         log_fn: Callable[[str], None] | None = None,
     ):
         self.vector_store = vector_store
+        self.image_vector_store = image_vector_store
         self.llm = llm
         self.toc_entries = toc_entries or []
         self.retrieval_k = retrieval_k
+        self.image_retrieval_k = image_retrieval_k
         self.topic_k = topic_k
         self.toc_candidate_pool = toc_candidate_pool
         self.chunk_head_chars = chunk_head_chars
@@ -266,8 +279,13 @@ class RagSearchEngine:
                 continue
             for j, doc in enumerate(docs, start=1):
                 page = doc.metadata.get("page", doc.metadata.get("page_number", "?"))
+                modality = doc.metadata.get("modality", "text")
                 head = _format_chunk_head(doc, self.chunk_head_chars)
-                self._log(f"  chunk {j} (page {page}): {head}")
+                if modality == "image":
+                    image_path = doc.metadata.get("image_path", "unknown")
+                    self._log(f"  image chunk {j} (page {page}): {head} [{image_path}]")
+                else:
+                    self._log(f"  chunk {j} (page {page}): {head}")
 
     def retrieve_all(
         self,
@@ -299,9 +317,18 @@ class RagSearchEngine:
         return _augment_query_with_toc_topics(search_query, related)
 
     def retrieve(self, search_query: str) -> list[Document]:
-        """Retrieve documents for one search query."""
+        """Retrieve text and image documents for one search query."""
         augmented = self._augment_search_query(search_query)
-        return self.vector_store.similarity_search(augmented, k=self.retrieval_k)
+        text_docs = self.vector_store.similarity_search(augmented, k=self.retrieval_k)
+
+        if self.image_vector_store:
+            image_docs = self.image_vector_store.similarity_search(
+                augmented,
+                k=self.image_retrieval_k,
+            )
+            return self._merge_documents([text_docs, image_docs])
+
+        return text_docs
 
     @staticmethod
     def _merge_documents(doc_lists: list[list[Document]]) -> list[Document]:
@@ -309,7 +336,10 @@ class RagSearchEngine:
         seen: set[str] = set()
         for docs in doc_lists:
             for doc in docs:
-                key = doc.page_content.strip()
+                if doc.metadata.get("modality") == "image":
+                    key = doc.metadata.get("image_path", doc.page_content)
+                else:
+                    key = doc.page_content.strip()
                 if key not in seen:
                     seen.add(key)
                     merged.append(doc)

@@ -16,25 +16,27 @@ API keys are read from HF_auth.log and deepseek_api_auth.log in this folder.
 
 import os
 import sys
-import uuid
 from pathlib import Path
 
-import faiss
 import numpy as np
 
+from faissIndex import (
+    build_faiss_vector_store,
+    load_faiss_vector_store,
+    save_faiss_vector_store,
+)
+from imageEmbedder import ImageEmbedder
 from searchEngine import RagSearchEngine
-from tocLoader import TocEntry, TocLoader, format_toc_entries
+from textEmbedder import TextEmbedder
+from tocLoader import TocLoader, format_toc_entries
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 HF_AUTH_LOG = SCRIPT_DIR / "HF_auth.log"
 DEEPSEEK_AUTH_LOG = SCRIPT_DIR / "deepseek_api_auth.log"
 
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_community.docstore.in_memory import InMemoryDocstore
-from langchain_community.vectorstores import FAISS
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # --- Configuration ---
@@ -55,12 +57,19 @@ HF_TOKEN = _load_secret_from_log(HF_AUTH_LOG, "HF_TOKEN")
 DEEPSEEK_API_KEY = _load_secret_from_log(DEEPSEEK_AUTH_LOG, "DEEPSEEK_API_KEY")
 DEEPSEEK_MODEL = "deepseek-chat"
 EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
+CLIP_MODEL = "sentence-transformers/clip-ViT-B-32"
 FAISS_INDEX_PATH = "faiss_index"
-FAISS_IVF_NLIST = 110
-FAISS_NPROBE = 32
+FAISS_IMAGE_INDEX_PATH = "faiss_image_index"
+EXTRACTED_IMAGE_DIR = "extracted_images"
+TEXT_FAISS_NLIST = 110
+TEXT_FAISS_NPROBE = 32
+IMAGE_FAISS_NLIST = 10
+IMAGE_FAISS_NPROBE = 32
 CHUNK_SIZE = 200
 CHUNK_OVERLAP = 30
-RETRIEVAL_K = 8
+RETRIEVAL_K = 2
+IMAGE_RETRIEVAL_K = 4
+MIN_IMAGE_SIZE = 64
 TOC_TOPIC_K = 5
 TOC_CANDIDATE_POOL = 100
 CHUNK_HEAD_CHARS = 150
@@ -80,42 +89,12 @@ def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def configure_hf_token() -> bool:
-    """Authenticate Hugging Face Hub downloads with HF_TOKEN."""
-    if not HF_TOKEN:
-        return False
-
-    os.environ["HF_TOKEN"] = HF_TOKEN
-    os.environ["HUGGINGFACEHUB_API_TOKEN"] = HF_TOKEN
-
-    try:
-        from huggingface_hub import login
-
-        login(token=HF_TOKEN, add_to_git_credential=False)
-    except ImportError:
-        pass
-
-    return True
-
-
 def build_llm() -> BaseChatModel:
     return init_chat_model(
         DEEPSEEK_MODEL,
         model_provider="deepseek",
         temperature=0.7,
         max_tokens=1024,
-    )
-
-
-def build_embeddings() -> HuggingFaceEmbeddings:
-    configure_hf_token()
-    model_kwargs = {}
-    if HF_TOKEN:
-        model_kwargs["token"] = HF_TOKEN
-
-    return HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL,
-        model_kwargs=model_kwargs,
     )
 
 
@@ -137,6 +116,7 @@ def load_documents(file_path: Path | str = DOCUMENT_FILE_PATH):
 
     for doc in docs:
         doc.metadata["source"] = str(path)
+        doc.metadata.setdefault("modality", "text")
 
     _log(f"Loaded {len(docs)} page(s) from {path.name}")
     return docs
@@ -154,85 +134,58 @@ def load_and_split_documents(file_path: Path | str = DOCUMENT_FILE_PATH):
     return splits
 
 
-def build_faiss_ivf_sq8_index(
-    vectors: np.ndarray,
-    *,
-    nlist: int = FAISS_IVF_NLIST,
-    nprobe: int = FAISS_NPROBE,
-) -> faiss.Index:
-    """Build a FAISS IVF index with 8-bit scalar quantization (IVF + SQ8)."""
-    if vectors.ndim != 2:
-        raise ValueError("vectors must be a 2D array")
-    num_vectors, embedding_dim = vectors.shape
-    if num_vectors == 0:
-        raise ValueError("Need at least one vector to build the index")
-
-    effective_nlist = min(nlist, num_vectors)
-    if effective_nlist < nlist:
-        _log(
-            f"Clamping IVF nlist from {nlist} to {effective_nlist} "
-            f"(only {num_vectors} vectors available)."
+def get_or_build_text_vector_store(text_embedder: TextEmbedder):
+    index_dir = Path(FAISS_INDEX_PATH)
+    if index_dir.is_dir() and (index_dir / "index.faiss").exists():
+        _log(f"Loading existing text FAISS index from {FAISS_INDEX_PATH}...")
+        return load_faiss_vector_store(
+            FAISS_INDEX_PATH,
+            text_embedder.langchain_embeddings,
+            nprobe=TEXT_FAISS_NPROBE,
         )
 
-    quantizer = faiss.IndexFlatL2(embedding_dim)
-    index = faiss.IndexIVFScalarQuantizer(
-        quantizer,
-        embedding_dim,
-        effective_nlist,
-        faiss.ScalarQuantizer.QT_8bit,
-    )
-
-    _log(f"Training FAISS IVF{effective_nlist},SQ8 index on {num_vectors} vectors...")
-    index.train(vectors)
-    index.add(vectors)
-    index.nprobe = min(nprobe, effective_nlist)
-    _log(f"FAISS index ready (nlist={effective_nlist}, nprobe={index.nprobe}).")
-    return index
-
-
-def _configure_faiss_search(index: faiss.Index, nprobe: int = FAISS_NPROBE) -> None:
-    """Set nprobe on IVF indexes when loading from disk."""
-    if isinstance(index, faiss.IndexIVF):
-        index.nprobe = min(nprobe, index.nlist)
-
-
-def build_vector_store(
-    splits,
-    embeddings: HuggingFaceEmbeddings | None = None,
-) -> FAISS:
-    embeddings = embeddings or build_embeddings()
+    _log(f"Loading and indexing document: {DOCUMENT_FILE_PATH.name}...")
+    splits = load_and_split_documents()
     texts = [doc.page_content for doc in splits]
-    _log(f"Embedding {len(texts)} chunks for IVF,SQ8 index...")
-    vectors = np.array(embeddings.embed_documents(texts), dtype=np.float32)
+    _log(f"Embedding {len(texts)} text chunks...")
+    vectors = np.array(text_embedder.embed_documents(texts), dtype=np.float32)
 
-    index = build_faiss_ivf_sq8_index(vectors)
-
-    docstore = InMemoryDocstore()
-    index_to_docstore_id: dict[int, str] = {}
-    for i, doc in enumerate(splits):
-        doc_id = str(uuid.uuid4())
-        index_to_docstore_id[i] = doc_id
-        docstore.add({doc_id: doc})
-
-    return FAISS(
-        embedding_function=embeddings,
-        index=index,
-        docstore=docstore,
-        index_to_docstore_id=index_to_docstore_id,
+    vector_store = build_faiss_vector_store(
+        splits,
+        vectors,
+        text_embedder.langchain_embeddings,
+        nlist=TEXT_FAISS_NLIST,
+        nprobe=TEXT_FAISS_NPROBE,
+        log_fn=_log,
     )
+    save_faiss_vector_store(vector_store, FAISS_INDEX_PATH)
+    _log(f"Saved text FAISS index to {FAISS_INDEX_PATH}.")
+    return vector_store
 
 
-def save_vector_store(vector_store: FAISS, path: str = FAISS_INDEX_PATH) -> None:
-    vector_store.save_local(path)
+def get_or_build_image_vector_store(image_embedder: ImageEmbedder):
+    index_dir = Path(FAISS_IMAGE_INDEX_PATH)
+    if index_dir.is_dir() and (index_dir / "index.faiss").exists():
+        _log(f"Loading existing image FAISS index from {FAISS_IMAGE_INDEX_PATH}...")
+        return image_embedder.load_vector_store(
+            FAISS_IMAGE_INDEX_PATH,
+            nprobe=IMAGE_FAISS_NPROBE,
+        )
 
+    if DOCUMENT_FILE_PATH.suffix.lower() != ".pdf":
+        _log("Image index skipped (document is not a PDF).")
+        return None
 
-def load_vector_store(
-    path: str = FAISS_INDEX_PATH,
-    embeddings: HuggingFaceEmbeddings | None = None,
-) -> FAISS:
-    embeddings = embeddings or build_embeddings()
-    vector_store = FAISS.load_local(path, embeddings, allow_dangerous_deserialization=True)
-    _configure_faiss_search(vector_store.index)
+    _log(f"Extracting and indexing images from: {DOCUMENT_FILE_PATH.name}...")
+    vector_store = image_embedder.build_vector_store(
+        nlist=IMAGE_FAISS_NLIST,
+        nprobe=IMAGE_FAISS_NPROBE,
+    )
+    if vector_store is None:
+        return None
+
+    image_embedder.save_vector_store(vector_store, FAISS_IMAGE_INDEX_PATH)
+    _log(f"Saved image FAISS index to {FAISS_IMAGE_INDEX_PATH}.")
     return vector_store
 
 
@@ -240,7 +193,7 @@ def load_document_toc(
     file_path: Path | str = DOCUMENT_FILE_PATH,
     *,
     preview_count: int = 12,
-) -> tuple[list[TocEntry], str]:
+):
     """Load PDF table of contents and print a preview."""
     path = Path(file_path)
     if path.suffix.lower() != ".pdf":
@@ -266,21 +219,6 @@ def load_document_toc(
     return toc_entries, toc_method
 
 
-def get_or_build_vector_store(embeddings: HuggingFaceEmbeddings) -> FAISS:
-    index_dir = Path(FAISS_INDEX_PATH)
-    if index_dir.is_dir() and (index_dir / "index.faiss").exists():
-        _log(f"Loading existing FAISS index from {FAISS_INDEX_PATH}...")
-        return load_vector_store(FAISS_INDEX_PATH, embeddings)
-
-    _log(f"Loading and indexing document: {DOCUMENT_FILE_PATH.name}...")
-    splits = load_and_split_documents()
-    _log("Building embeddings...")
-    vector_store = build_vector_store(splits, embeddings)
-    save_vector_store(vector_store)
-    _log(f"Saved FAISS index to {FAISS_INDEX_PATH}.")
-    return vector_store
-
-
 def run_question_with_search_trace(
     search_engine: RagSearchEngine,
     question: str,
@@ -289,8 +227,7 @@ def run_question_with_search_trace(
     sub_queries, doc_lists, merged_docs = search_engine.retrieve_all(question)
     search_engine.print_search_details(question, sub_queries, doc_lists)
     _log(f"Merged {len(merged_docs)} unique chunk(s) for final answer.")
-    answer = search_engine.synthesize_answer(question, sub_queries, merged_docs)
-    return answer
+    return search_engine.synthesize_answer(question, sub_queries, merged_docs)
 
 
 def main():
@@ -303,20 +240,31 @@ def main():
     else:
         _log("HF_TOKEN not set; using anonymous Hub access (may be slower).")
 
-    toc_entries, toc_method = load_document_toc()
+    toc_entries, _toc_method = load_document_toc()
 
-    _log("Loading embedding model (downloads on first run)...")
-    embeddings = build_embeddings()
+    _log("Loading text embedding model...")
+    text_embedder = TextEmbedder(model_name=EMBEDDING_MODEL, hf_token=HF_TOKEN)
+    text_vector_store = get_or_build_text_vector_store(text_embedder)
 
-    vector_store = get_or_build_vector_store(embeddings)
+    _log("Loading CLIP image embedder...")
+    image_embedder = ImageEmbedder(
+        DOCUMENT_FILE_PATH,
+        clip_model=CLIP_MODEL,
+        min_image_size=MIN_IMAGE_SIZE,
+        extracted_image_dir=EXTRACTED_IMAGE_DIR,
+        log_fn=_log,
+    )
+    image_vector_store = get_or_build_image_vector_store(image_embedder)
 
     _log("Connecting to DeepSeek API...")
     llm = build_llm()
     search_engine = RagSearchEngine(
-        vector_store,
+        text_vector_store,
         llm,
         toc_entries=toc_entries,
+        image_vector_store=image_vector_store,
         retrieval_k=RETRIEVAL_K,
+        image_retrieval_k=IMAGE_RETRIEVAL_K,
         topic_k=TOC_TOPIC_K,
         toc_candidate_pool=TOC_CANDIDATE_POOL,
         chunk_head_chars=CHUNK_HEAD_CHARS,

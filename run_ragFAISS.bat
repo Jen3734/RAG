@@ -22,6 +22,13 @@ echo Upgrading pip...
 ::    exit /b 1
 ::)
 
+echo Installing dependencies from requirements.txt...
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+if errorlevel 1 (
+    echo pip install failed.
+    pause
+    exit /b 1
+)
 echo Running ragFAISS.py ...
 .venv\Scripts\python.exe ragFAISS.py
 pause
