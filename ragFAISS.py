@@ -25,7 +25,12 @@ from faissIndex import (
     load_faiss_vector_store,
     save_faiss_vector_store,
 )
-from imageEmbedder import ImageEmbedder
+from imageEmbedder import (
+    DEFAULT_FINGERPRINT_REGISTRY,
+    DEFAULT_REFORMATTED_TEXT_DIR,
+    FingerPrintEmbedding,
+    ImageEmbedder,
+)
 from searchEngine import RagSearchEngine
 from textEmbedder import TextEmbedder
 from tocLoader import TocLoader, format_toc_entries
@@ -36,6 +41,7 @@ DEEPSEEK_AUTH_LOG = SCRIPT_DIR / "deepseek_api_auth.log"
 
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain.chat_models import init_chat_model
+from langchain_core.documents import Document
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -61,13 +67,15 @@ CLIP_MODEL = "sentence-transformers/clip-ViT-B-32"
 FAISS_INDEX_PATH = "faiss_index"
 FAISS_IMAGE_INDEX_PATH = "faiss_image_index"
 EXTRACTED_IMAGE_DIR = "extracted_images"
+REFORMATTED_TEXT_DIR = DEFAULT_REFORMATTED_TEXT_DIR
+FINGERPRINT_REGISTRY_PATH = DEFAULT_FINGERPRINT_REGISTRY
 TEXT_FAISS_NLIST = 110
 TEXT_FAISS_NPROBE = 32
 IMAGE_FAISS_NLIST = 10
 IMAGE_FAISS_NPROBE = 32
 CHUNK_SIZE = 200
 CHUNK_OVERLAP = 30
-RETRIEVAL_K = 2
+RETRIEVAL_K = 8
 IMAGE_RETRIEVAL_K = 4
 MIN_IMAGE_SIZE = 64
 TOC_TOPIC_K = 5
@@ -122,8 +130,7 @@ def load_documents(file_path: Path | str = DOCUMENT_FILE_PATH):
     return docs
 
 
-def load_and_split_documents(file_path: Path | str = DOCUMENT_FILE_PATH):
-    docs = load_documents(file_path)
+def split_documents(docs):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
@@ -134,7 +141,66 @@ def load_and_split_documents(file_path: Path | str = DOCUMENT_FILE_PATH):
     return splits
 
 
-def get_or_build_text_vector_store(text_embedder: TextEmbedder):
+def load_and_split_documents(file_path: Path | str = DOCUMENT_FILE_PATH):
+    docs = load_documents(file_path)
+    return split_documents(docs)
+
+
+def get_or_build_reformatted_documents(
+    image_embedder: ImageEmbedder,
+) -> tuple[list[Document], FingerPrintEmbedding]:
+    """Run image embedding first: mark images in text and build fingerprint registry."""
+    registry_path = Path(FINGERPRINT_REGISTRY_PATH)
+    pdf_stem = DOCUMENT_FILE_PATH.stem.replace(" ", "_")[:80]
+    reformatted_text_path = Path(REFORMATTED_TEXT_DIR) / f"{pdf_stem}.txt"
+
+    if (
+        registry_path.is_file()
+        and reformatted_text_path.is_file()
+        and DOCUMENT_FILE_PATH.suffix.lower() == ".pdf"
+    ):
+        _log(f"Loading reformatted document from {reformatted_text_path.name}...")
+        registry = FingerPrintEmbedding.load(registry_path)
+        raw_text = reformatted_text_path.read_text(encoding="utf-8")
+        page_documents: list[Document] = []
+        for section in raw_text.split("--- Page "):
+            section = section.strip()
+            if not section:
+                continue
+            header, _, body = section.partition(" ---\n")
+            if not header.isdigit():
+                continue
+            page_number = int(header)
+            page_documents.append(
+                Document(
+                    page_content=body.strip(),
+                    metadata={
+                        "source": str(DOCUMENT_FILE_PATH),
+                        "modality": "text",
+                        "page": page_number - 1,
+                        "page_number": page_number,
+                    },
+                )
+            )
+        _log(f"Loaded {registry.image_count} fingerprinted image(s) from registry.")
+        return page_documents, registry
+
+    if DOCUMENT_FILE_PATH.suffix.lower() != ".pdf":
+        _log("Image reformat skipped (document is not a PDF); using plain text load.")
+        return load_documents(DOCUMENT_FILE_PATH), FingerPrintEmbedding()
+
+    _log(f"Reformatting document with image marks: {DOCUMENT_FILE_PATH.name}...")
+    return image_embedder.reformat_document_with_image_marks(
+        reformatted_text_dir=REFORMATTED_TEXT_DIR,
+        registry_path=registry_path,
+    )
+
+
+def get_or_build_text_vector_store(
+    text_embedder: TextEmbedder,
+    *,
+    source_documents=None,
+):
     index_dir = Path(FAISS_INDEX_PATH)
     if index_dir.is_dir() and (index_dir / "index.faiss").exists():
         _log(f"Loading existing text FAISS index from {FAISS_INDEX_PATH}...")
@@ -145,7 +211,10 @@ def get_or_build_text_vector_store(text_embedder: TextEmbedder):
         )
 
     _log(f"Loading and indexing document: {DOCUMENT_FILE_PATH.name}...")
-    splits = load_and_split_documents()
+    if source_documents is None:
+        splits = load_and_split_documents()
+    else:
+        splits = split_documents(source_documents)
     texts = [doc.page_content for doc in splits]
     _log(f"Embedding {len(texts)} text chunks...")
     vectors = np.array(text_embedder.embed_documents(texts), dtype=np.float32)
@@ -227,7 +296,8 @@ def run_question_with_search_trace(
     sub_queries, doc_lists, merged_docs = search_engine.retrieve_all(question)
     search_engine.print_search_details(question, sub_queries, doc_lists)
     _log(f"Merged {len(merged_docs)} unique chunk(s) for final answer.")
-    return search_engine.synthesize_answer(question, sub_queries, merged_docs)
+    refined_docs = search_engine.refine_answer(question, sub_queries, merged_docs)
+    return search_engine.synthesize_answer(question, sub_queries, refined_docs)
 
 
 def main():
@@ -242,10 +312,6 @@ def main():
 
     toc_entries, _toc_method = load_document_toc()
 
-    _log("Loading text embedding model...")
-    text_embedder = TextEmbedder(model_name=EMBEDDING_MODEL, hf_token=HF_TOKEN)
-    text_vector_store = get_or_build_text_vector_store(text_embedder)
-
     _log("Loading CLIP image embedder...")
     image_embedder = ImageEmbedder(
         DOCUMENT_FILE_PATH,
@@ -254,7 +320,18 @@ def main():
         extracted_image_dir=EXTRACTED_IMAGE_DIR,
         log_fn=_log,
     )
-    image_vector_store = get_or_build_image_vector_store(image_embedder)
+    reformatted_documents, fingerprint_registry = get_or_build_reformatted_documents(
+        image_embedder
+    )
+
+    _log("Loading text embedding model...")
+    text_embedder = TextEmbedder(model_name=EMBEDDING_MODEL, hf_token=HF_TOKEN)
+    text_vector_store = get_or_build_text_vector_store(
+        text_embedder,
+        source_documents=reformatted_documents,
+    )
+
+    # image_vector_store = get_or_build_image_vector_store(image_embedder)
 
     _log("Connecting to DeepSeek API...")
     llm = build_llm()
@@ -262,9 +339,11 @@ def main():
         text_vector_store,
         llm,
         toc_entries=toc_entries,
-        image_vector_store=image_vector_store,
+        # image_vector_store=image_vector_store,
+        fingerprint_registry=fingerprint_registry,
+        clip_embeddings=image_embedder.clip_embeddings,
         retrieval_k=RETRIEVAL_K,
-        image_retrieval_k=IMAGE_RETRIEVAL_K,
+        # image_retrieval_k=IMAGE_RETRIEVAL_K,
         topic_k=TOC_TOPIC_K,
         toc_candidate_pool=TOC_CANDIDATE_POOL,
         chunk_head_chars=CHUNK_HEAD_CHARS,
@@ -272,11 +351,12 @@ def main():
     )
 
     questions = [
-        "Explain what is the Backup Timer Indicator",
-        "what to do if a ct scan is aborted?",
-        "what is the difference between a scout and a primary scan?",
-        "what is the difference between a GSI scan and a helical scan?",
-        "what are the major axial scan rotation frequencies?",
+       # "Explain what is the Backup Timer Indicator",
+       # "what to do if a ct scan is aborted?",
+       # "what is the difference between a scout and a primary scan?",
+       # "what is the difference between a GSI scan and a helical scan?",
+       # "what are the major axial scan rotation frequencies?",
+        "What are the PDU warning signs?",
     ]
     for q in questions:
         _log(f"\nQ: {q}")

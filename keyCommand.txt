@@ -18,4 +18,4 @@ Remove-Item -Recurse -Force faiss_index
             1. next step would be to further consice the sub queries. some are still duplicated, but most sub queries various in meanings.
 3. Add image capabilities
     1. enable image index through clip model and add to faiss index for search (check)
-    1. find that indexing images through clip and add to faiss index does not work. try to embed the image into text through fingurprint and store a dictionary of fingerprint for retreival
+    2. find that indexing images through clip and add to faiss index does not work. try to embed the image into text through fingurprint and store a dictionary of fingerprint for retreival

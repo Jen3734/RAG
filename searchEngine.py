@@ -6,13 +6,16 @@ and final answer synthesis.
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from collections.abc import Callable
+from pathlib import Path
 
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 
+from imageEmbedder import ClipEmbeddings, FingerPrintEmbedding, IMAGE_MARK_PATTERN
 from tocLoader import TocEntry
 
 DEFAULT_RETRIEVAL_K = 8
@@ -20,6 +23,17 @@ DEFAULT_IMAGE_RETRIEVAL_K = 4
 DEFAULT_TOC_TOPIC_K = 5
 DEFAULT_TOC_CANDIDATE_POOL = 100
 DEFAULT_CHUNK_HEAD_CHARS = 150
+DEFAULT_CLIP_DESCRIPTION_TOP_K = 3
+
+CLIP_VISUAL_CANDIDATES = (
+    "a technical diagram from a medical device manual",
+    "a screenshot of a control panel or user interface",
+    "an indicator light, icon, or status display",
+    "a table of technical specifications or parameters",
+    "a photograph of medical imaging equipment",
+    "a flowchart or procedural illustration",
+    "a warning or safety label",
+)
 
 QUERY_DECOMPOSE_PROMPT = ChatPromptTemplate.from_messages(
     [
@@ -27,6 +41,10 @@ QUERY_DECOMPOSE_PROMPT = ChatPromptTemplate.from_messages(
             "system",
             "You analyze user questions for document search and split them into focused "
             "search queries (one per line).\n"
+            "The manual text contains inline image placeholders written as [IMAGE_MARK N], "
+            "where each number links to a CLIP-indexed image (diagrams, UI screenshots, "
+            "warning labels, indicator lights, icons, and status signs). Retrieved chunks "
+            "may include CLIP image descriptions appended as 'Image #N: ...'.\n"
             "Rules:\n"
             "- If the question contains multiple independent sub-questions, split each into "
             "a separate search query.\n"
@@ -37,6 +55,13 @@ QUERY_DECOMPOSE_PROMPT = ChatPromptTemplate.from_messages(
             "- Generate sub-queries with different meanings and search angles; do not repeat "
             "or rephrase the same query in different words.\n"
             "- Always include the original question intent as at least one search query.\n"
+            "- Image-aware retrieval: when the question involves warnings, indicators, signs, "
+            "lights, icons, symbols, alarms, status displays, control panels, or other visual "
+            "elements, add at least one sub-query that explicitly targets the related "
+            "[IMAGE_MARK] illustrations (e.g. 'warning indicator sign icon image for [term]', "
+            "'visual display or diagram of [term]', 'control panel indicator for [term]').\n"
+            "- Prefer sub-queries that will retrieve chunks containing [IMAGE_MARK N] markers "
+            "and CLIP image descriptions when those images would help explain the answer.\n"
             "Return ONLY the search queries, one per line, with no numbering or bullets.",
         ),
         ("human", "Question: {query}\n\nSearch queries:"),
@@ -49,7 +74,11 @@ FINAL_ANSWER_PROMPT = ChatPromptTemplate.from_messages(
             "system",
             "Answer the user's question using only the retrieved context below. "
             "If the context does not contain enough information, say you don't know. "
-            "When multiple sub-questions were searched, address each part clearly.",
+            "When multiple sub-questions were searched, address each part clearly.\n"
+            "The context may include CLIP-analyzed images identified as [Image #N] with "
+            "descriptions. When an image helps explain the answer—especially for warnings, "
+            "indicators, signs, icons, or control-panel displays—reference it inline using "
+            "exactly [Image #N] (image number only, no file path).",
         ),
         (
             "human",
@@ -219,14 +248,237 @@ def _format_documents_for_prompt(docs: list[Document]) -> str:
         source = doc.metadata.get("source", "unknown")
         if doc.metadata.get("modality") == "image":
             image_path = doc.metadata.get("image_path", "unknown")
+            image_number = doc.metadata.get("image_number", "?")
             blocks.append(
-                f"[{i}] Image source: {source}\n"
+                f"[{i}] Image #{image_number} source: {source}\n"
                 f"Image file: {image_path}\n"
                 f"{doc.page_content}"
             )
         else:
-            blocks.append(f"[{i}] Source: {source}\n{doc.page_content}")
+            referenced_images = doc.metadata.get("referenced_images", [])
+            image_lines = ""
+            if referenced_images:
+                image_lines = "\n".join(
+                    f"Referenced image #{ref['image_number']}: {ref['image_path']}"
+                    for ref in referenced_images
+                )
+                image_lines = f"\n{image_lines}"
+            blocks.append(f"[{i}] Source: {source}\n{doc.page_content}{image_lines}")
     return "\n\n".join(blocks)
+
+
+def _resolve_image_marks_in_documents(
+    docs: list[Document],
+    fingerprint_registry: FingerPrintEmbedding | None,
+) -> list[Document]:
+    """When chunks contain [IMAGE_MARK N], attach the numbered image to results."""
+    if not fingerprint_registry:
+        return docs
+
+    resolved: list[Document] = []
+    seen_image_numbers: set[int] = set()
+
+    for doc in docs:
+        resolved.append(doc)
+        referenced_images = []
+        for match in IMAGE_MARK_PATTERN.finditer(doc.page_content):
+            image_number = int(match.group(1))
+            image_path = fingerprint_registry.get_image_path(image_number)
+            if image_path is None or not image_path.is_file():
+                continue
+            referenced_images.append(
+                {
+                    "image_number": image_number,
+                    "image_path": str(image_path.resolve()),
+                    "fingerprint": fingerprint_registry.get_fingerprint(image_number),
+                }
+            )
+            if image_number in seen_image_numbers:
+                continue
+            seen_image_numbers.add(image_number)
+            resolved.append(
+                Document(
+                    page_content=(
+                        f"[Image #{image_number}] referenced near: "
+                        f"{_format_chunk_head(doc, 120)}"
+                    ),
+                    metadata={
+                        "source": doc.metadata.get("source", "unknown"),
+                        "modality": "image",
+                        "image_number": image_number,
+                        "image_path": str(image_path.resolve()),
+                        "fingerprint": fingerprint_registry.get_fingerprint(image_number),
+                        "page": doc.metadata.get("page"),
+                        "page_number": doc.metadata.get("page_number"),
+                    },
+                )
+            )
+
+        if referenced_images:
+            doc.metadata["referenced_images"] = referenced_images
+
+    return resolved
+
+
+def _strip_image_marks(text: str) -> str:
+    return IMAGE_MARK_PATTERN.sub("", text).strip()
+
+
+def _collect_image_paths(documents: list[Document]) -> dict[int, str]:
+    """Map image numbers to local image file paths from retrieved documents."""
+    image_paths: dict[int, str] = {}
+    for doc in documents:
+        if doc.metadata.get("modality") == "image":
+            image_number = doc.metadata.get("image_number")
+            image_path = doc.metadata.get("image_path")
+            if image_number is not None and image_path:
+                image_paths[int(image_number)] = str(image_path)
+    return image_paths
+
+
+def _collect_image_contexts(
+    documents: list[Document],
+    question: str,
+    sub_queries: list[str],
+) -> dict[int, list[str]]:
+    """Build CLIP text candidates per image from the question and chunk context."""
+    image_paths = _collect_image_paths(documents)
+    contexts: dict[int, list[str]] = defaultdict(list)
+    base_candidates = [question, *sub_queries, *CLIP_VISUAL_CANDIDATES]
+
+    for image_number in image_paths:
+        contexts[image_number].extend(base_candidates)
+
+    for doc in documents:
+        chunk_text = _strip_image_marks(doc.page_content)
+        if not chunk_text:
+            continue
+
+        if doc.metadata.get("modality") == "image":
+            image_number = doc.metadata.get("image_number")
+            if image_number is not None:
+                contexts[int(image_number)].append(chunk_text)
+            continue
+
+        referenced_numbers = {
+            int(ref["image_number"])
+            for ref in doc.metadata.get("referenced_images", [])
+        }
+        for match in IMAGE_MARK_PATTERN.finditer(doc.page_content):
+            referenced_numbers.add(int(match.group(1)))
+
+        for image_number in referenced_numbers:
+            if image_number in contexts:
+                contexts[image_number].append(chunk_text)
+
+    return contexts
+
+
+def _describe_retrieved_images(
+    documents: list[Document],
+    question: str,
+    sub_queries: list[str],
+    clip_embeddings: ClipEmbeddings | None,
+    *,
+    top_k: int = DEFAULT_CLIP_DESCRIPTION_TOP_K,
+    log_fn: Callable[[str], None] = _default_log,
+) -> dict[int, str]:
+    """Analyze retrieved images with CLIP and return image-number descriptions."""
+    image_paths = _collect_image_paths(documents)
+    if not image_paths or clip_embeddings is None:
+        return {}
+
+    contexts = _collect_image_contexts(documents, question, sub_queries)
+    descriptions: dict[int, str] = {}
+
+    for image_number, image_path in sorted(image_paths.items()):
+        path = Path(image_path)
+        if not path.is_file():
+            continue
+        description = clip_embeddings.describe_image(
+            path,
+            contexts.get(image_number, [question, *sub_queries]),
+            top_k=top_k,
+        )
+        descriptions[image_number] = description
+        log_fn(f"CLIP image #{image_number}: {description}")
+
+    return descriptions
+
+
+def _append_image_descriptions_to_documents(
+    documents: list[Document],
+    descriptions: dict[int, str],
+) -> list[Document]:
+    """Attach image-number/description pairs to the end of relevant chunks."""
+    if not descriptions:
+        return documents
+
+    refined: list[Document] = []
+    for doc in documents:
+        image_numbers: set[int] = set()
+        if doc.metadata.get("modality") == "image":
+            image_number = doc.metadata.get("image_number")
+            if image_number is not None:
+                image_numbers.add(int(image_number))
+        for ref in doc.metadata.get("referenced_images", []):
+            image_numbers.add(int(ref["image_number"]))
+        for match in IMAGE_MARK_PATTERN.finditer(doc.page_content):
+            image_numbers.add(int(match.group(1)))
+
+        relevant = [
+            (image_number, descriptions[image_number])
+            for image_number in sorted(image_numbers)
+            if image_number in descriptions
+        ]
+        if not relevant:
+            refined.append(doc)
+            continue
+
+        description_lines = "\n".join(
+            f"Image #{image_number}: {description}"
+            for image_number, description in relevant
+        )
+        updated = Document(
+            page_content=f"{doc.page_content.rstrip()}\n\n{description_lines}",
+            metadata=dict(doc.metadata),
+        )
+        updated.metadata["clip_image_descriptions"] = {
+            str(image_number): description for image_number, description in relevant
+        }
+        refined.append(updated)
+
+    return refined
+
+
+def _format_answer_image_mark(image_number: int) -> str:
+    return f"[Image #{image_number}]"
+
+
+def _collect_clip_related_image_numbers(documents: list[Document]) -> list[int]:
+    """Return sorted image numbers referenced in CLIP-refined chunks."""
+    numbers: set[int] = set()
+    for doc in documents:
+        clip_descriptions = doc.metadata.get("clip_image_descriptions", {})
+        numbers.update(int(image_number) for image_number in clip_descriptions)
+    return sorted(numbers)
+
+
+def _insert_related_images_into_answer(answer: str, image_numbers: list[int]) -> str:
+    """Append related CLIP image markers to the final answer."""
+    if not image_numbers:
+        return answer
+
+    missing = [
+        image_number
+        for image_number in image_numbers
+        if _format_answer_image_mark(image_number) not in answer
+    ]
+    if not missing:
+        return answer
+
+    image_lines = "\n".join(_format_answer_image_mark(image_number) for image_number in missing)
+    return f"{answer.rstrip()}\n\nRelated images:\n{image_lines}"
 
 
 class RagSearchEngine:
@@ -239,6 +491,8 @@ class RagSearchEngine:
         *,
         toc_entries: list[TocEntry] | None = None,
         image_vector_store: FAISS | None = None,
+        fingerprint_registry: FingerPrintEmbedding | None = None,
+        clip_embeddings: ClipEmbeddings | None = None,
         retrieval_k: int = DEFAULT_RETRIEVAL_K,
         image_retrieval_k: int = DEFAULT_IMAGE_RETRIEVAL_K,
         topic_k: int = DEFAULT_TOC_TOPIC_K,
@@ -248,6 +502,8 @@ class RagSearchEngine:
     ):
         self.vector_store = vector_store
         self.image_vector_store = image_vector_store
+        self.fingerprint_registry = fingerprint_registry
+        self.clip_embeddings = clip_embeddings
         self.llm = llm
         self.toc_entries = toc_entries or []
         self.retrieval_k = retrieval_k
@@ -283,9 +539,18 @@ class RagSearchEngine:
                 head = _format_chunk_head(doc, self.chunk_head_chars)
                 if modality == "image":
                     image_path = doc.metadata.get("image_path", "unknown")
-                    self._log(f"  image chunk {j} (page {page}): {head} [{image_path}]")
+                    image_number = doc.metadata.get("image_number", "?")
+                    self._log(
+                        f"  image chunk {j} (page {page}, #{image_number}): "
+                        f"{head} [{image_path}]"
+                    )
                 else:
-                    self._log(f"  chunk {j} (page {page}): {head}")
+                    refs = doc.metadata.get("referenced_images", [])
+                    ref_note = ""
+                    if refs:
+                        numbers = ", ".join(f"#{r['image_number']}" for r in refs)
+                        ref_note = f" [images: {numbers}]"
+                    self._log(f"  chunk {j} (page {page}): {head}{ref_note}")
 
     def retrieve_all(
         self,
@@ -320,6 +585,7 @@ class RagSearchEngine:
         """Retrieve text and image documents for one search query."""
         augmented = self._augment_search_query(search_query)
         text_docs = self.vector_store.similarity_search(augmented, k=self.retrieval_k)
+        text_docs = _resolve_image_marks_in_documents(text_docs, self.fingerprint_registry)
 
         if self.image_vector_store:
             image_docs = self.image_vector_store.similarity_search(
@@ -338,12 +604,38 @@ class RagSearchEngine:
             for doc in docs:
                 if doc.metadata.get("modality") == "image":
                     key = doc.metadata.get("image_path", doc.page_content)
+                elif doc.metadata.get("image_number") is not None:
+                    key = f"image:{doc.metadata['image_number']}"
                 else:
                     key = doc.page_content.strip()
                 if key not in seen:
                     seen.add(key)
                     merged.append(doc)
         return merged
+
+    def refine_answer(
+        self,
+        question: str,
+        sub_queries: list[str],
+        documents: list[Document],
+    ) -> list[Document]:
+        """Analyze retrieved images with CLIP and append image descriptions to chunks."""
+        if not documents or self.clip_embeddings is None:
+            return documents
+
+        image_paths = _collect_image_paths(documents)
+        if not image_paths:
+            return documents
+
+        self._log(f"Refining answer context with CLIP for {len(image_paths)} image(s)...")
+        descriptions = _describe_retrieved_images(
+            documents,
+            question,
+            sub_queries,
+            self.clip_embeddings,
+            log_fn=self._log,
+        )
+        return _append_image_descriptions_to_documents(documents, descriptions)
 
     def synthesize_answer(
         self,
@@ -365,7 +657,14 @@ class RagSearchEngine:
                 "context": context,
             }
         )
-        return response.content if isinstance(response.content, str) else str(response.content)
+        answer = response.content if isinstance(response.content, str) else str(response.content)
+        related_images = _collect_clip_related_image_numbers(documents)
+        if related_images:
+            self._log(
+                "Inserting related CLIP images into answer: "
+                + ", ".join(f"#{n}" for n in related_images)
+            )
+        return _insert_related_images_into_answer(answer, related_images)
 
     def search(self, question: str) -> str:
         """
@@ -375,4 +674,5 @@ class RagSearchEngine:
         sub_queries, doc_lists, merged_docs = self.retrieve_all(question)
         self.print_search_details(question, sub_queries, doc_lists)
         self._log(f"Merged {len(merged_docs)} unique chunk(s) for final answer.")
-        return self.synthesize_answer(question, sub_queries, merged_docs)
+        refined_docs = self.refine_answer(question, sub_queries, merged_docs)
+        return self.synthesize_answer(question, sub_queries, refined_docs)
